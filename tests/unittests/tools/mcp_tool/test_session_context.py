@@ -548,3 +548,198 @@ class TestSessionContext:
 
       # Should not raise exception
       assert session_context._close_event.is_set()
+
+
+class TestRunGuarded:
+  """Tests for SessionContext.run_guarded()."""
+
+  @pytest.mark.asyncio
+  async def test_run_guarded_normal_completion(self):
+    """Test run_guarded returns result when coroutine completes normally."""
+    mock_client = MockClient()
+    mock_session = MockClientSession()
+
+    with patch(
+        'google.adk.tools.mcp_tool.session_context.ClientSession'
+    ) as mock_session_class:
+      mock_session_class.return_value = mock_session
+
+      session_context = SessionContext(
+          mock_client, timeout=5.0, sse_read_timeout=None
+      )
+      await session_context.start()
+
+      async def my_coro():
+        return 'hello'
+
+      result = await session_context.run_guarded(my_coro())
+      assert result == 'hello'
+
+      await session_context.close()
+
+  @pytest.mark.asyncio
+  async def test_run_guarded_background_task_crash(self):
+    """Test run_guarded raises ConnectionError when background task dies."""
+    mock_client = MockClient()
+    mock_session = MockClientSession()
+
+    with patch(
+        'google.adk.tools.mcp_tool.session_context.ClientSession'
+    ) as mock_session_class:
+      mock_session_class.return_value = mock_session
+
+      session_context = SessionContext(
+          mock_client, timeout=5.0, sse_read_timeout=None
+      )
+      await session_context.start()
+
+      crash_error = RuntimeError('403 Forbidden')
+
+      async def hanging_coro():
+        await asyncio.sleep(100)
+
+      # Kill the background task and replace with one that's already failed
+      session_context._task.cancel()
+      try:
+        await session_context._task
+      except (asyncio.CancelledError, Exception):
+        pass
+
+      async def failing_task():
+        raise crash_error
+
+      session_context._task = asyncio.create_task(failing_task())
+      await asyncio.sleep(0.01)
+
+      coro = hanging_coro()
+      with pytest.raises(ConnectionError) as exc_info:
+        await session_context.run_guarded(coro)
+
+      assert '403 Forbidden' in str(exc_info.value)
+      assert exc_info.value.__cause__ is crash_error
+
+  @pytest.mark.asyncio
+  async def test_run_guarded_task_already_dead(self):
+    """Test run_guarded raises immediately when task is already done."""
+    mock_client = MockClient()
+    mock_session = MockClientSession()
+
+    with patch(
+        'google.adk.tools.mcp_tool.session_context.ClientSession'
+    ) as mock_session_class:
+      mock_session_class.return_value = mock_session
+
+      session_context = SessionContext(
+          mock_client, timeout=5.0, sse_read_timeout=None
+      )
+      await session_context.start()
+
+      original_error = ValueError('transport died')
+
+      async def failing_task():
+        raise original_error
+
+      session_context._task.cancel()
+      try:
+        await session_context._task
+      except (asyncio.CancelledError, Exception):
+        pass
+
+      session_context._task = asyncio.create_task(failing_task())
+      await asyncio.sleep(0.01)
+
+      async def my_coro():
+        return 'should not reach'
+
+      coro = my_coro()
+      with pytest.raises(ConnectionError) as exc_info:
+        await session_context.run_guarded(coro)
+
+      assert 'already terminated' in str(exc_info.value)
+      assert exc_info.value.__cause__ is original_error
+
+  @pytest.mark.asyncio
+  async def test_run_guarded_cancels_coroutine_on_crash(self):
+    """Test that run_guarded cancels the coroutine when the task crashes."""
+    mock_client = MockClient()
+    mock_session = MockClientSession()
+
+    coro_was_cancelled = False
+
+    with patch(
+        'google.adk.tools.mcp_tool.session_context.ClientSession'
+    ) as mock_session_class:
+      mock_session_class.return_value = mock_session
+
+      session_context = SessionContext(
+          mock_client, timeout=5.0, sse_read_timeout=None
+      )
+      await session_context.start()
+
+      async def slow_coro():
+        nonlocal coro_was_cancelled
+        try:
+          await asyncio.sleep(100)
+        except asyncio.CancelledError:
+          coro_was_cancelled = True
+          raise
+
+      # Replace the background task with one that will fail soon
+      session_context._close_event.set()
+      await asyncio.sleep(0.05)
+
+      crash_error = RuntimeError('connection lost')
+
+      async def crashing_task():
+        await asyncio.sleep(0.05)
+        raise crash_error
+
+      session_context._task = asyncio.create_task(crashing_task())
+
+      with pytest.raises(ConnectionError):
+        await session_context.run_guarded(slow_coro())
+
+      assert coro_was_cancelled
+
+  @pytest.mark.asyncio
+  async def test_run_guarded_coroutine_raises(self):
+    """Test run_guarded propagates coroutine exceptions unwrapped."""
+    mock_client = MockClient()
+    mock_session = MockClientSession()
+
+    with patch(
+        'google.adk.tools.mcp_tool.session_context.ClientSession'
+    ) as mock_session_class:
+      mock_session_class.return_value = mock_session
+
+      session_context = SessionContext(
+          mock_client, timeout=5.0, sse_read_timeout=None
+      )
+      await session_context.start()
+
+      original_error = ValueError('invalid arguments')
+
+      async def failing_coro():
+        raise original_error
+
+      with pytest.raises(ValueError) as exc_info:
+        await session_context.run_guarded(failing_coro())
+
+      assert exc_info.value is original_error
+
+      await session_context.close()
+
+  @pytest.mark.asyncio
+  async def test_run_guarded_no_task(self):
+    """Test run_guarded raises when task has not been started."""
+    mock_client = MockClient()
+    session_context = SessionContext(
+        mock_client, timeout=5.0, sse_read_timeout=None
+    )
+
+    async def my_coro():
+      return 'hello'
+
+    coro = my_coro()
+    with pytest.raises(ConnectionError, match='not been started'):
+      await session_context.run_guarded(coro)

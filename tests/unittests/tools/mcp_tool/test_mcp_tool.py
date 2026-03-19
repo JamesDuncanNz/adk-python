@@ -69,6 +69,7 @@ class TestMCPTool:
     """Set up test fixtures."""
     self.mock_mcp_tool = MockMCPTool()
     self.mock_session_manager = Mock(spec=MCPSessionManager)
+    self.mock_session_manager.get_session_context.return_value = None
     self.mock_session = AsyncMock()
     self.mock_session_manager.create_session = AsyncMock(
         return_value=self.mock_session

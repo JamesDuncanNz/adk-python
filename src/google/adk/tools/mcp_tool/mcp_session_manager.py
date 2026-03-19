@@ -232,9 +232,16 @@ class MCPSessionManager:
       self._connection_params = connection_params
     self._errlog = errlog
 
-    # Session pool: maps session keys to (session, exit_stack, loop) tuples
+    # Session pool: maps session keys to
+    # (session, exit_stack, loop, session_context) tuples
     self._sessions: Dict[
-        str, tuple[ClientSession, AsyncExitStack, asyncio.AbstractEventLoop]
+        str,
+        tuple[
+            ClientSession,
+            AsyncExitStack,
+            asyncio.AbstractEventLoop,
+            SessionContext,
+        ],
     ] = {}
 
     # Map of event loops to their respective locks to prevent race conditions
@@ -307,16 +314,49 @@ class MCPSessionManager:
 
     return base_headers
 
-  def _is_session_disconnected(self, session: ClientSession) -> bool:
+  def _is_session_disconnected(
+      self,
+      session: ClientSession,
+      session_context: Optional[SessionContext] = None,
+  ) -> bool:
     """Checks if a session is disconnected or closed.
 
     Args:
         session: The ClientSession to check.
+        session_context: Optional SessionContext to check if the background
+            task has died (e.g. due to a transport crash).
 
     Returns:
         True if the session is disconnected, False otherwise.
     """
-    return session._read_stream._closed or session._write_stream._closed
+    if session._read_stream._closed or session._write_stream._closed:
+      return True
+    if session_context is not None and not session_context.is_task_alive:
+      return True
+    return False
+
+  def get_session_context(
+      self, headers: Optional[Dict[str, str]] = None
+  ) -> Optional[SessionContext]:
+    """Returns the SessionContext for the session matching the given headers.
+
+    Note: This method reads from the session pool without acquiring
+    ``_session_lock``. This is safe because it is called immediately after
+    ``create_session()`` (which populates the entry under the lock) within
+    the same task, and dict reads are atomic in CPython.
+
+    Args:
+        headers: Optional headers used to identify the session.
+
+    Returns:
+        The SessionContext if a matching session exists, None otherwise.
+    """
+    merged_headers = self._merge_headers(headers)
+    session_key = self._generate_session_key(merged_headers)
+    entry = self._sessions.get(session_key)
+    if entry is not None:
+      return entry[3]
+    return None
 
   async def _cleanup_session(
       self,
@@ -445,12 +485,14 @@ class MCPSessionManager:
     async with self._session_lock:
       # Check if we have an existing session
       if session_key in self._sessions:
-        session, exit_stack, stored_loop = self._sessions[session_key]
+        session, exit_stack, stored_loop, session_ctx = self._sessions[
+            session_key
+        ]
 
         # Check if the existing session is still connected and bound to the current loop
         current_loop = asyncio.get_running_loop()
         if stored_loop is current_loop and not self._is_session_disconnected(
-            session
+            session, session_ctx
         ):
           # Session is still good, return it
           return session
@@ -479,25 +521,25 @@ class MCPSessionManager:
         client = self._create_client(merged_headers)
         is_stdio = isinstance(self._connection_params, StdioConnectionParams)
 
+        session_context = SessionContext(
+            client=client,
+            timeout=timeout_in_seconds,
+            sse_read_timeout=sse_read_timeout_in_seconds,
+            is_stdio=is_stdio,
+            sampling_callback=self._sampling_callback,
+            sampling_capabilities=self._sampling_capabilities,
+        )
         session = await asyncio.wait_for(
-            exit_stack.enter_async_context(
-                SessionContext(
-                    client=client,
-                    timeout=timeout_in_seconds,
-                    sse_read_timeout=sse_read_timeout_in_seconds,
-                    is_stdio=is_stdio,
-                    sampling_callback=self._sampling_callback,
-                    sampling_capabilities=self._sampling_capabilities,
-                )
-            ),
+            exit_stack.enter_async_context(session_context),
             timeout=timeout_in_seconds,
         )
 
-        # Store session, exit stack, and loop in the pool
+        # Store session, exit stack, loop, and context in the pool
         self._sessions[session_key] = (
             session,
             exit_stack,
             asyncio.get_running_loop(),
+            session_context,
         )
         logger.debug('Created new session: %s', session_key)
         return session
@@ -541,7 +583,7 @@ class MCPSessionManager:
     """Closes all sessions and cleans up resources."""
     async with self._session_lock:
       for session_key in list(self._sessions.keys()):
-        _, exit_stack, stored_loop = self._sessions[session_key]
+        _, exit_stack, stored_loop, _ = self._sessions[session_key]
         await self._cleanup_session(session_key, exit_stack, stored_loop)
 
 

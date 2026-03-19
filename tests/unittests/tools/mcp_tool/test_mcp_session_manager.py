@@ -301,9 +301,10 @@ class TestMCPSessionManager:
           assert len(manager._sessions) == 1
           assert "stdio_session" in manager._sessions
           session_data = manager._sessions["stdio_session"]
-          assert len(session_data) == 3
+          assert len(session_data) == 4
           assert session_data[0] == mock_session
           assert session_data[2] == asyncio.get_running_loop()
+          assert session_data[3] is not None  # SessionContext stored
 
           # Verify SessionContext was created
           mock_session_context_class.assert_called_once()
@@ -318,10 +319,13 @@ class TestMCPSessionManager:
     # Create mock existing session
     existing_session = MockClientSession()
     existing_exit_stack = MockAsyncExitStack()
+    mock_session_ctx = Mock()
+    mock_session_ctx.is_task_alive = True
     manager._sessions["stdio_session"] = (
         existing_session,
         existing_exit_stack,
         asyncio.get_running_loop(),
+        mock_session_ctx,
     )
 
     # Session is connected
@@ -391,11 +395,13 @@ class TestMCPSessionManager:
         session1,
         exit_stack1,
         asyncio.get_running_loop(),
+        Mock(),
     )
     manager._sessions["session2"] = (
         session2,
         exit_stack2,
         asyncio.get_running_loop(),
+        Mock(),
     )
 
     await manager.close()
@@ -423,11 +429,13 @@ class TestMCPSessionManager:
         session1,
         exit_stack1,
         asyncio.get_running_loop(),
+        Mock(),
     )
     manager._sessions["session2"] = (
         session2,
         exit_stack2,
         asyncio.get_running_loop(),
+        Mock(),
     )
 
     # Should not raise exception
@@ -553,10 +561,13 @@ class TestMCPSessionManager:
     # Use a dummy object as a different loop
     different_loop = Mock(spec=asyncio.AbstractEventLoop)
 
+    mock_session_ctx = Mock()
+    mock_session_ctx.is_task_alive = True
     manager._sessions["stdio_session"] = (
         mock_session,
         mock_exit_stack,
         different_loop,
+        mock_session_ctx,
     )
 
     # 2. Mock creation of a new session
@@ -594,11 +605,21 @@ class TestMCPSessionManager:
 
     session1 = MockClientSession()
     exit_stack1 = MockAsyncExitStack()
-    manager._sessions["session1"] = (session1, exit_stack1, current_loop)
+    manager._sessions["session1"] = (
+        session1,
+        exit_stack1,
+        current_loop,
+        Mock(),
+    )
 
     session2 = MockClientSession()
     exit_stack2 = MockAsyncExitStack()
-    manager._sessions["session2"] = (session2, exit_stack2, different_loop)
+    manager._sessions["session2"] = (
+        session2,
+        exit_stack2,
+        different_loop,
+        Mock(),
+    )
 
     await manager.close()
 
@@ -619,7 +640,12 @@ class TestMCPSessionManager:
     assert isinstance(lock, asyncio.Lock)
 
     # Add a mock session to verify it's cleared on pickling
-    manager._sessions["test"] = (Mock(), Mock(), asyncio.get_running_loop())
+    manager._sessions["test"] = (
+        Mock(),
+        Mock(),
+        asyncio.get_running_loop(),
+        Mock(),
+    )
 
     # Pickle and unpickle
     pickled = pickle.dumps(manager)
@@ -726,3 +752,81 @@ async def test_retry_on_errors_decorator_does_not_retry_exception_from_cancel():
     await mock_function(mock_self)
 
   assert call_count == 1
+
+
+class TestGetSessionContext:
+  """Tests for MCPSessionManager.get_session_context()."""
+
+  def setup_method(self):
+    self.mock_stdio_params = StdioServerParameters(
+        command="test_command", args=[]
+    )
+    self.mock_stdio_connection_params = StdioConnectionParams(
+        server_params=self.mock_stdio_params, timeout=5.0
+    )
+
+  def test_get_session_context_returns_context(self):
+    """Test that get_session_context returns the stored SessionContext."""
+    manager = MCPSessionManager(self.mock_stdio_connection_params)
+
+    mock_ctx = Mock()
+    manager._sessions["stdio_session"] = (
+        Mock(),
+        Mock(),
+        Mock(),
+        mock_ctx,
+    )
+
+    result = manager.get_session_context()
+    assert result is mock_ctx
+
+  def test_get_session_context_returns_none_when_no_session(self):
+    """Test that get_session_context returns None when no session exists."""
+    manager = MCPSessionManager(self.mock_stdio_connection_params)
+
+    result = manager.get_session_context()
+    assert result is None
+
+
+class TestIsSessionDisconnectedWithContext:
+  """Tests for enhanced _is_session_disconnected with SessionContext."""
+
+  def setup_method(self):
+    self.mock_stdio_params = StdioServerParameters(
+        command="test_command", args=[]
+    )
+    self.mock_stdio_connection_params = StdioConnectionParams(
+        server_params=self.mock_stdio_params, timeout=5.0
+    )
+
+  def test_detects_dead_task(self):
+    """Test that a done background task is detected as disconnected."""
+    manager = MCPSessionManager(self.mock_stdio_connection_params)
+    session = MockClientSession()
+
+    mock_ctx = Mock()
+    mock_ctx.is_task_alive = False
+
+    assert manager._is_session_disconnected(session, mock_ctx)
+
+  def test_alive_task_not_disconnected(self):
+    """Test that an alive background task is not detected as disconnected."""
+    manager = MCPSessionManager(self.mock_stdio_connection_params)
+    session = MockClientSession()
+
+    mock_ctx = Mock()
+    mock_ctx.is_task_alive = True
+
+    assert not manager._is_session_disconnected(session, mock_ctx)
+
+  def test_no_context_falls_back_to_stream_check(self):
+    """Test that without context, only stream state is checked."""
+    manager = MCPSessionManager(self.mock_stdio_connection_params)
+    session = MockClientSession()
+
+    assert not manager._is_session_disconnected(session)
+    assert not manager._is_session_disconnected(session, None)
+
+    session._read_stream._closed = True
+    assert manager._is_session_disconnected(session)
+    assert manager._is_session_disconnected(session, None)

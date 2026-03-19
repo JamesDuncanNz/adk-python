@@ -373,12 +373,25 @@ class McpTool(BaseAuthenticatedTool):
     # Resolve progress callback (may be a factory that needs runtime context)
     resolved_callback = self._resolve_progress_callback(tool_context)
 
-    response = await session.call_tool(
+    call_coro = session.call_tool(
         self._mcp_tool.name,
         arguments=args,
         progress_callback=resolved_callback,
         meta=meta_trace_context,
     )
+
+    # Race the tool call against the background session task so that
+    # transport crashes (e.g. non-2xx HTTP responses) surface immediately
+    # instead of hanging until sse_read_timeout expires.
+    # ConnectionError is intentionally NOT caught here so that it
+    # propagates to retry_on_errors, which will create a fresh session.
+    session_context = self._mcp_session_manager.get_session_context(
+        headers=final_headers
+    )
+    if session_context:
+      response = await session_context.run_guarded(call_coro)
+    else:
+      response = await call_coro
     result = response.model_dump(exclude_none=True, mode="json")
 
     # Push UI widget to the event actions if the tool supports it.
